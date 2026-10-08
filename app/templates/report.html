@@ -1,0 +1,144 @@
+{% extends 'base.html' %}
+
+{% block title %}QC Report #{{ run.id }} — {{ run.host_name }}{% endblock %}
+
+{% block content %}
+
+<!-- Header -->
+<div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 2rem;">
+    <div>
+        <div style="display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.3rem;">
+            <h1 style="font-size: 1.8rem; font-weight: 800; color: var(--suse-dark-green);">
+                QC Report: {{ run.host_name }}
+            </h1>
+            <span class="status-badge PASS">Run #{{ run.id }}</span>
+            <span class="serial-tag-badge" style="font-size: 0.85rem; padding: 0.25rem 0.6rem;">
+                <i class="fa-solid fa-barcode"></i> Serial: {{ run.serial_number or 'N/A' }}
+            </span>
+        </div>
+        <p style="color: var(--text-muted); font-size: 0.95rem;">
+            IP Address: <strong style="color: var(--suse-dark-green);">{{ run.host_ip }}</strong> | Run Date: {{ run.started_at }} | Checked By: SUSE Automated QC Web Portal
+        </p>
+    </div>
+    <div style="display: flex; gap: 0.75rem;">
+        <a href="{{ url_for('main.download_report_csv', run_id=run.id) }}" class="btn btn-primary">
+            <i class="fa-solid fa-download"></i> Export CSV Report
+        </a>
+        <a href="{{ url_for('main.dashboard') }}" class="btn btn-outline">
+            <i class="fa-solid fa-arrow-left"></i> Dashboard
+        </a>
+    </div>
+</div>
+
+<!-- Report Summary Cards -->
+<div class="stats-grid">
+    <div class="stat-card">
+        <div class="stat-info">
+            <div class="stat-label">QC Score</div>
+            <div class="stat-value" style="color: {% if '100%' in run.score or '9' in run.score %}var(--pass-color){% else %}var(--fail-color){% endif %};">
+                {{ run.score }}
+            </div>
+        </div>
+        <div class="stat-icon green">
+            <i class="fa-solid fa-award"></i>
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-info">
+            <div class="stat-label">Total Checks</div>
+            <div class="stat-value">{{ run.total_checks }}</div>
+        </div>
+        <div class="stat-icon blue">
+            <i class="fa-solid fa-list-check"></i>
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-info">
+            <div class="stat-label">Passed</div>
+            <div class="stat-value" style="color: var(--pass-color);">{{ run.pass_count }}</div>
+        </div>
+        <div class="stat-icon green">
+            <i class="fa-solid fa-circle-check"></i>
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-info">
+            <div class="stat-label">Failed</div>
+            <div class="stat-value" style="color: var(--fail-color);">{{ run.fail_count }}</div>
+        </div>
+        <div class="stat-icon red">
+            <i class="fa-solid fa-circle-xmark"></i>
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-info">
+            <div class="stat-label">Warnings</div>
+            <div class="stat-value" style="color: var(--warn-color);">{{ run.warn_count }}</div>
+        </div>
+        <div class="stat-icon amber">
+            <i class="fa-solid fa-triangle-exclamation"></i>
+        </div>
+    </div>
+</div>
+
+<!-- Filters -->
+<div class="filter-bar">
+    <button class="filter-btn active" data-filter="all">All Checks ({{ checks|length }})</button>
+    <button class="filter-btn" data-filter="FAIL" style="color: var(--fail-color);">FAIL ({{ run.fail_count }})</button>
+    <button class="filter-btn" data-filter="WARNING" style="color: var(--warn-color);">WARNING ({{ run.warn_count }})</button>
+    <button class="filter-btn" data-filter="PASS" style="color: var(--pass-color);">PASS ({{ run.pass_count }})</button>
+    
+    {% for s in sections %}
+        <button class="filter-btn" data-filter="{{ s }}">{{ s }}</button>
+    {% endfor %}
+</div>
+
+<!-- Detailed Checks Table -->
+<div class="table-card">
+    <div class="table-responsive">
+        <table>
+            <thead>
+                <tr>
+                    <th style="width: 120px;">Section</th>
+                    <th style="width: 50px;">S.No</th>
+                    <th>Check Item</th>
+                    <th>Command Used</th>
+                    <th>Expected Result</th>
+                    <th>Actual Result</th>
+                    <th style="width: 90px;">Status</th>
+                    <th>Notes / Action Required</th>
+                </tr>
+            </thead>
+            <tbody id="report-table-body">
+                {% for c in checks %}
+                <tr data-status="{{ c.status }}" data-section="{{ c.section }}">
+                    <td>
+                        <span class="status-badge INFO" style="font-size: 0.7rem;">{{ c.section }}</span>
+                    </td>
+                    <td>#{{ c.sno }}</td>
+                    <td><strong>{{ c.check_item }}</strong></td>
+                    <td><code style="background: #f1f5f9; border: 1px solid #cbd5e1; padding: 3px 6px; border-radius: 4px; font-size: 0.8rem; color: #0369a1;">{{ c.command_used }}</code></td>
+                    <td style="font-size: 0.85rem; color: var(--text-muted);">{{ c.expected }}</td>
+                    <td style="font-size: 0.85rem; font-weight: 600; font-family: monospace;">{{ c.actual }}</td>
+                    <td>
+                        <span class="status-badge {{ c.status }}">
+                            {{ c.status }}
+                        </span>
+                    </td>
+                    <td style="font-size: 0.85rem; color: {% if c.status == 'FAIL' %}var(--fail-color){% elif c.status == 'WARNING' %}var(--warn-color){% else %}var(--text-muted){% endif %};">
+                        {{ c.notes or '—' }}
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="8" style="text-align: center; color: var(--text-muted); padding: 2rem;">
+                        No check items found for this report.
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+{% endblock %}

@@ -1,0 +1,59 @@
+#!/bin/sh
+
+# BIOS
+BIOS_INFO=$(sudo dmidecode -t bios 2>/dev/null | awk -F': ' '
+/Vendor:/  {v=$2}
+/Version:/ {ver=$2}
+END {print v " | Version: " ver}
+')
+echo "BIOS      : $BIOS_INFO"
+
+# iDRAC / BMC
+BMC_INFO=$(sudo ipmitool mc info 2>/dev/null | awk -F': ' '
+/Manufacturer Name/ {v=$2}
+/Firmware Revision/ {f=$2}
+END {print v " | FW: " f}
+')
+echo "iDRAC/BMC : $BMC_INFO"
+
+# NICs - group identical hardware and firmware
+NIC_INFO=$(
+for iface in /sys/class/net/*; do
+    iface=$(basename "$iface")
+    [ "$iface" = "lo" ] && continue
+
+    INFO=$(ethtool -i "$iface" 2>/dev/null)
+    BUS=$(echo "$INFO" | awk -F': ' '/^bus-info:/ {print $2}')
+    FW=$(echo "$INFO" | awk -F': ' '/^firmware-version:/ {print $2}')
+
+    [ -z "$BUS" ] && continue
+    [ -z "$FW" ] || [ "$FW" = "N/A" ] && continue
+
+    MODEL=$(lspci -s "$BUS" 2>/dev/null | sed 's/.*: //')
+    [ -z "$MODEL" ] && continue
+
+    # Remove PCI revision from model name
+    MODEL=$(echo "$MODEL" | sed 's/ (rev [^)]*)//')
+
+    echo "$MODEL | FW: $FW"
+done | sort -u | paste -sd ';' -
+)
+
+echo "NICs      : $NIC_INFO"
+
+# FC - Online ports only
+FC_INFO=$(systool -c fc_host -v 2>/dev/null | awk -F'"' '
+/Class Device =/ {
+    host=$2
+    online=0
+}
+/port_state/ {
+    online=($0 ~ /Online/)
+}
+/symbolic_name/ && online {
+    printf "%s: %s; ", host, $2
+    online=0
+}
+')
+
+echo "FC Active : $FC_INFO"

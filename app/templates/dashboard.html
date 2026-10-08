@@ -1,0 +1,404 @@
+{% extends 'base.html' %}
+
+{% block title %}QC Dashboard{% endblock %}
+
+{% block content %}
+
+<!-- Header -->
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
+    <div>
+        <h1 style="font-size: 1.8rem; font-weight: 800; color: #ffffff;">
+            QC Dashboard
+        </h1>
+    </div>
+    <div style="display: flex; gap: 0.75rem;">
+        <button type="button" class="btn btn-outline" data-modal-target="custom-check-modal">
+            <i class="fa-solid fa-plus-circle"></i> Add Custom Check
+        </button>
+        <button type="button" class="btn btn-primary" data-modal-target="add-host-modal">
+            <i class="fa-solid fa-plus"></i> Add KVM Host
+        </button>
+    </div>
+</div>
+
+<!-- Serial Tag & Host Search Box -->
+<div class="search-box-card">
+    <i class="fa-solid fa-magnifying-glass" style="font-size: 1.2rem; color: var(--suse-green);"></i>
+    <form action="{{ url_for('main.dashboard') }}" method="GET" style="display: flex; width: 100%; gap: 0.75rem;">
+        <input type="text" name="q" class="search-input" placeholder="Search history by Serial Tag, Hostname, or IP..." value="{{ search_query }}">
+        <button type="submit" class="btn btn-primary">
+            <i class="fa-solid fa-filter"></i> Search
+        </button>
+        {% if search_query %}
+            <a href="{{ url_for('main.dashboard') }}" class="btn btn-secondary">Clear</a>
+        {% endif %}
+    </form>
+</div>
+
+<!-- Global Stats Grid -->
+<div class="stats-grid">
+    <div class="stat-card">
+        <div class="stat-info">
+            <div class="stat-label">Hosts</div>
+            <div class="stat-value">{{ total_hosts }}</div>
+        </div>
+        <div class="stat-icon green">
+            <i class="fa-solid fa-server"></i>
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-info">
+            <div class="stat-label">Total Runs</div>
+            <div class="stat-value">{{ total_runs }}</div>
+        </div>
+        <div class="stat-icon blue">
+            <i class="fa-solid fa-clipboard-check"></i>
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-info">
+            <div class="stat-label">Passed</div>
+            <div class="stat-value" style="color: var(--pass-color);">{{ sum_pass }}</div>
+        </div>
+        <div class="stat-icon green">
+            <i class="fa-solid fa-check-circle"></i>
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-info">
+            <div class="stat-label">Failed</div>
+            <div class="stat-value" style="color: var(--fail-color);">{{ sum_fail }}</div>
+        </div>
+        <div class="stat-icon red">
+            <i class="fa-solid fa-circle-exclamation"></i>
+        </div>
+    </div>
+</div>
+
+<!-- KVM Hosts Section -->
+<div class="section-title">
+    <span><i class="fa-solid fa-cubes" style="color: var(--suse-green);"></i> Managed Nodes</span>
+</div>
+
+<div class="host-grid">
+    {% for host in hosts %}
+    <div class="host-card">
+        <div>
+            <div class="host-card-header">
+                <div>
+                    <div class="host-title">{{ host.name }}</div>
+                    <div class="host-ip"><i class="fa-solid fa-network-wired"></i> {{ host.ip }}:{{ host.port }}</div>
+                    <div class="serial-tag-badge">
+                        <i class="fa-solid fa-barcode"></i> Serial: {{ host.serial_number or 'N/A' }}
+                    </div>
+                </div>
+                {% if host.score %}
+                    {% if '100%' in host.score or '9' in host.score %}
+                        <span class="badge-score pass"><i class="fa-solid fa-shield-check"></i> {{ host.score }}</span>
+                    {% else %}
+                        <span class="badge-score fail"><i class="fa-solid fa-triangle-exclamation"></i> {{ host.score }}</span>
+                    {% endif %}
+                {% else %}
+                    <span class="badge-score none">Never Checked</span>
+                {% endif %}
+            </div>
+
+            <div class="host-card-body">
+                <div class="host-stats-mini">
+                    <div class="mini-stat-item">
+                        <span style="color: var(--text-muted);">PASS</span>
+                        <strong style="color: var(--pass-color);">{{ host.pass_count or 0 }}</strong>
+                    </div>
+                    <div class="mini-stat-item">
+                        <span style="color: var(--text-muted);">FAIL</span>
+                        <strong style="color: var(--fail-color);">{{ host.fail_count or 0 }}</strong>
+                    </div>
+                    <div class="mini-stat-item">
+                        <span style="color: var(--text-muted);">WARN</span>
+                        <strong style="color: var(--warn-color);">{{ host.warn_count or 0 }}</strong>
+                    </div>
+                    <div class="mini-stat-item">
+                        <span style="color: var(--text-muted);">N/A</span>
+                        <strong style="color: var(--na-color);">{{ host.na_count or 0 }}</strong>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="host-card-actions">
+            <a href="{{ url_for('main.run_qc_page', host_id=host.id) }}" class="btn btn-primary btn-sm" style="flex: 1; justify-content: center;">
+                <i class="fa-solid fa-play"></i> Run QC
+            </a>
+
+            {% if host.last_run_id %}
+                <a href="{{ url_for('main.report_detail', run_id=host.last_run_id) }}" class="btn btn-outline btn-sm" title="View Report">
+                    <i class="fa-solid fa-file-lines"></i> Report
+                </a>
+            {% endif %}
+
+            <button type="button" class="btn btn-secondary btn-sm btn-test-conn" data-host-id="{{ host.id }}" title="Test Connection">
+                <i class="fa-solid fa-plug"></i>
+            </button>
+
+            <button type="button" class="btn btn-amber btn-sm" data-modal-target="remediate-modal-{{ host.id }}" onclick="fetchIloUsers({{ host.id }})" title="Remediation Actions">
+                <i class="fa-solid fa-wrench"></i> Fix
+            </button>
+        </div>
+    </div>
+
+    <!-- Remediation Modal with Dynamic iLO User Fetch -->
+    <div class="modal" id="remediate-modal-{{ host.id }}">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3><i class="fa-solid fa-wrench" style="color: #f59e0b;"></i> Remediation Tasks: {{ host.name }}</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <p style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1.5rem;">
+                Controlled write actions for node <strong style="color: var(--suse-dark-green);">{{ host.ip }}</strong> (Serial: {{ host.serial_number or 'N/A' }}).
+            </p>
+
+            <div style="display: flex; flex-direction: column; gap: 1rem;">
+                <!-- Task 1: Create unx61234 User -->
+                <div style="background: #f8fafc; padding: 1rem; border-radius: 8px; border: 1px solid var(--border-color);">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <div>
+                            <strong style="display: block; color: var(--suse-dark-green);">1. Create `unx61234` User</strong>
+                            <span style="font-size: 0.8rem; color: var(--text-muted);">Creates user, sets password & sets never expires (chage -M -1)</span>
+                        </div>
+                        <button type="button" class="btn btn-amber btn-sm" onclick="runRemediation({{ host.id }}, 'create_user')">
+                            Create User
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Task 2: Change Root Password -->
+                <div style="background: #f8fafc; padding: 1rem; border-radius: 8px; border: 1px solid var(--border-color);">
+                    <strong style="display: block; margin-bottom: 0.5rem; color: var(--suse-dark-green);">2. Change Root Password</strong>
+                    <div style="display: flex; gap: 0.5rem;">
+                        <input type="password" id="root-pass-{{ host.id }}" class="form-control" placeholder="New Root Password" style="font-size: 0.85rem;">
+                        <button type="button" class="btn btn-amber btn-sm" onclick="
+                            const p = document.getElementById('root-pass-{{ host.id }}').value;
+                            if (!p) { alert('Please enter new root password'); return; }
+                            runRemediation({{ host.id }}, 'change_root_pass', { new_pass: p });
+                        ">
+                            Update
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Task 3: Change iLO / BMC Password with User Selector -->
+                <div style="background: #f8fafc; padding: 1rem; border-radius: 8px; border: 1px solid var(--border-color);">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                        <strong style="color: var(--suse-dark-green);">3. Change iLO/BMC Password</strong>
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="fetchIloUsers({{ host.id }})" style="font-size: 0.75rem; padding: 2px 6px;">
+                            <i class="fa-solid fa-arrows-rotate"></i> Fetch iLO Users
+                        </button>
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 0.5rem;">
+                        <select id="ilo-user-select-{{ host.id }}" class="form-control" style="font-size: 0.85rem;">
+                            <option value="2">ID 2: root (Default)</option>
+                        </select>
+                        <div style="display: flex; gap: 0.5rem;">
+                            <input type="password" id="ilo-pass-{{ host.id }}" class="form-control" placeholder="New iLO Password" style="font-size: 0.85rem;">
+                            <button type="button" class="btn btn-amber btn-sm" onclick="
+                                const uid = document.getElementById('ilo-user-select-{{ host.id }}').value;
+                                const p = document.getElementById('ilo-pass-{{ host.id }}').value;
+                                if (!uid || !p) { alert('Please select user ID and enter new password'); return; }
+                                runRemediation({{ host.id }}, 'change_ilo_pass', { user_id: uid, new_pass: p });
+                            ">
+                                Update iLO
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+<!-- NEW FEATURE: Ad-Hoc SSH Command Console -->
+<div class="section-title" style="margin-top: 2.5rem;">
+    <span><i class="fa-solid fa-terminal" style="color: var(--suse-green);"></i> Ad-Hoc Command Console</span>
+</div>
+
+<div class="table-card" style="padding: 1.5rem;">
+    <div style="display: flex; gap: 0.75rem; margin-bottom: 1rem; flex-wrap: wrap;">
+        <select id="adhoc-host-id" class="form-control" style="width: 250px;">
+            {% for h in hosts %}
+                <option value="{{ h.id }}">{{ h.name }} ({{ h.ip }})</option>
+            {% endfor %}
+        </select>
+        <input type="text" id="adhoc-cmd-input" class="form-control" placeholder="Type read-only command (e.g. uptime, free -m, ip a, df -h)" style="flex: 1;" value="uptime">
+        <button type="button" class="btn btn-primary" onclick="runAdhocCommand()">
+            <i class="fa-solid fa-paper-plane"></i> Execute Command
+        </button>
+    </div>
+    <pre id="adhoc-output-box" style="display: none; background: #0c1e19; color: #6ee7b7; padding: 1rem; border-radius: 8px; font-family: 'Fira Code', monospace; font-size: 0.85rem; max-height: 250px; overflow-y: auto; border: 1px solid var(--suse-green);"></pre>
+</div>
+
+<!-- Add Host Modal -->
+<div class="modal" id="add-host-modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>Add New KVM Host</h3>
+            <button class="modal-close">&times;</button>
+        </div>
+        <form action="{{ url_for('main.add_host') }}" method="POST">
+            <div class="form-group">
+                <label>Host Name / FQDN</label>
+                <input type="text" name="name" class="form-control" placeholder="e.g. kvm-host-01" required>
+            </div>
+            <div class="form-group">
+                <label>IP Address</label>
+                <input type="text" name="ip" class="form-control" placeholder="e.g. 192.168.209.137" required>
+            </div>
+            <div class="form-group">
+                <label>SSH Port</label>
+                <input type="number" name="port" class="form-control" value="22" required>
+            </div>
+            <div class="form-group">
+                <label>SSH Username</label>
+                <input type="text" name="username" class="form-control" value="root" required>
+            </div>
+            <div class="form-group">
+                <label>Authentication Method</label>
+                <select name="auth_type" class="form-control">
+                    <option value="key">SSH Private Key</option>
+                    <option value="password">SSH Password</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>SSH Key Path</label>
+                <input type="text" name="ssh_key_path" class="form-control" placeholder="/root/.ssh/id_rsa">
+            </div>
+            <div class="form-group">
+                <label>SSH Password</label>
+                <input type="password" name="password" class="form-control" placeholder="Password">
+            </div>
+            <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.5rem;">
+                <button type="button" class="btn btn-secondary modal-close">Cancel</button>
+                <button type="submit" class="btn btn-primary">Add Host</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- NEW FEATURE: Add Custom QC Check Modal -->
+<div class="modal" id="custom-check-modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>Add Custom QC Check</h3>
+            <button class="modal-close">&times;</button>
+        </div>
+        <form action="{{ url_for('main.add_custom_qc_check') }}" method="POST">
+            <div class="form-group">
+                <label>Check Item Name</label>
+                <input type="text" name="item_name" class="form-control" placeholder="e.g. Verify Custom Service Status" required>
+            </div>
+            <div class="form-group">
+                <label>Bash Command to Execute</label>
+                <input type="text" name="command" class="form-control" placeholder="e.g. systemctl is-active custom-service" required>
+            </div>
+            <div class="form-group">
+                <label>Section Category</label>
+                <select name="section" class="form-control">
+                    <option value="Operating System">Operating System</option>
+                    <option value="Hardware">Hardware</option>
+                    <option value="Cluster">Cluster</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Expected Result String</label>
+                <input type="text" name="expected" class="form-control" value="active (running)" required>
+            </div>
+            <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1rem;">
+                This check will be appended directly into the <code>QC.sh</code> script executed on remote KVM nodes.
+            </p>
+            <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
+                <button type="button" class="btn btn-secondary modal-close">Cancel</button>
+                <button type="submit" class="btn btn-primary">Update Script & Save</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Past QC History Table + Option to Delete History -->
+<div class="section-title" style="margin-top: 2.5rem;">
+    <span><i class="fa-solid fa-history" style="color: var(--suse-green);"></i> QC History</span>
+    {% if recent_runs %}
+    <form action="{{ url_for('main.clear_all_history') }}" method="POST" onsubmit="return confirm('Are you sure you want to clear ALL QC history records?');">
+        <button type="submit" class="btn btn-danger btn-sm">
+            <i class="fa-solid fa-trash"></i> Clear All History
+        </button>
+    </form>
+    {% endif %}
+</div>
+
+<div class="table-card">
+    <div class="table-responsive">
+        <table>
+            <thead>
+                <tr>
+                    <th>Run ID</th>
+                    <th>Serial Tag</th>
+                    <th>Node</th>
+                    <th>IP Address</th>
+                    <th>Started At</th>
+                    <th>Pass / Total</th>
+                    <th>Score</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for r in recent_runs %}
+                <tr>
+                    <td>#{{ r.id }}</td>
+                    <td>
+                        <span class="serial-tag-badge">
+                            <i class="fa-solid fa-barcode"></i> {{ r.serial_number or 'N/A' }}
+                        </span>
+                    </td>
+                    <td><strong>{{ r.host_name }}</strong></td>
+                    <td style="font-family: monospace;">{{ r.host_ip }}</td>
+                    <td>{{ r.started_at }}</td>
+                    <td>
+                        <span style="color: var(--pass-color); font-weight: 700;">{{ r.pass_count }}</span> / {{ r.total_checks }}
+                    </td>
+                    <td>
+                        <strong style="color: {% if '100%' in r.score or '9' in r.score %}var(--pass-color){% else %}var(--fail-color){% endif %};">
+                            {{ r.score }}
+                        </strong>
+                    </td>
+                    <td>
+                        <span class="status-badge {{ r.status | upper }}">
+                            {{ r.status }}
+                        </span>
+                    </td>
+                    <td>
+                        <div style="display: flex; gap: 0.4rem;">
+                            <a href="{{ url_for('main.report_detail', run_id=r.id) }}" class="btn btn-outline btn-sm">
+                                <i class="fa-solid fa-file-lines"></i> View
+                            </a>
+                            <form action="{{ url_for('main.delete_history_run', run_id=r.id) }}" method="POST" onsubmit="return confirm('Delete Run #{{ r.id }}?');" style="display: inline;">
+                                <button type="submit" class="btn btn-danger btn-sm" title="Delete Run">
+                                    <i class="fa-solid fa-trash"></i>
+                                </button>
+                            </form>
+                        </div>
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="9" style="text-align: center; color: var(--text-muted); padding: 2rem;">
+                        No QC execution history found.
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+{% endblock %}

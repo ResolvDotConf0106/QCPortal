@@ -1,0 +1,825 @@
+#!/usr/bin/env bash
+
+set -o pipefail
+
+# ============================================================
+# Physical Server QC Check Script (Bash only)
+# Output  : Single CSV report containing all sections
+# Sections: Hardware, Operating System, Cluster
+# Safe    : READ-ONLY QC checks. Remediation (--fix) performs writes.
+# ============================================================
+
+STATUS_PASS="PASS"
+STATUS_FAIL="FAIL"
+STATUS_WARN="WARNING"
+STATUS_NA="N/A"
+STATUS_INFO="INFO"
+
+PASS_COUNT=0
+FAIL_COUNT=0
+WARN_COUNT=0
+NA_COUNT=0
+INFO_COUNT=0
+
+FIX_MODE=0
+for arg in "$@"; do
+    case "$arg" in
+        --fix|-f) FIX_MODE=1 ;;
+        --help|-h)
+            printf 'Usage: %s [--fix]\n' "$0"
+            printf '  (no args)   Run read-only QC checks only\n'
+            printf '  --fix, -f   Run QC checks, then run remediation tasks\n'
+            printf '              (create unx61234 user, set/expire its password,\n'
+            printf '               change root password, change iLO/BMC password)\n'
+            exit 0
+            ;;
+    esac
+done
+
+TS="$(date +%Y%m%d_%H%M%S)"
+HOST="$(hostnamectl --static 2>/dev/null || hostname 2>/dev/null || echo server)"
+HOST_SAFE="$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9._-' '_')"
+REPORT="server_qc_${HOST_SAFE}_${TS}.csv"
+LOG_FILE="server_qc_${HOST_SAFE}_${TS}.log"
+
+touch "$LOG_FILE" 2>/dev/null || true
+
+log_msg() {
+    printf '%s\n' "$1" | tee -a "$LOG_FILE"
+}
+
+run() {
+    local timeout_sec="${1:-15}"
+    shift || true
+    timeout "$timeout_sec" bash -c "$*" 2>/dev/null
+}
+
+cmd_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+first_line() {
+    printf '%s\n' "$1" | awk 'NF {print; exit}'
+}
+
+clamp() {
+    local text="$1"
+    local max="${2:-180}"
+    if [ "${#text}" -gt "$max" ]; then
+        printf '%s…' "${text:0:max}"
+    else
+        printf '%s' "$text"
+    fi
+}
+
+csv_escape() {
+    local s="${1//\"/\"\"}"
+    printf '"%s"' "$s"
+}
+
+init_csv() {
+    printf 'Section,S.No,Check Item,Command Used,Expected Result,Actual Result,Status,Notes / Action\n' > "$REPORT"
+}
+
+append_row() {
+    {
+        csv_escape "$1"; printf ','
+        csv_escape "$2"; printf ','
+        csv_escape "$3"; printf ','
+        csv_escape "$4"; printf ','
+        csv_escape "$5"; printf ','
+        csv_escape "$6"; printf ','
+        csv_escape "$7"; printf ','
+        csv_escape "$8"
+        printf '\n'
+    } >> "$REPORT"
+}
+
+record_check() {
+    local section="$1"
+    local sno="$2"
+    local item="$3"
+    local command_used="$4"
+    local expected="$5"
+    local actual="$6"
+    local status="$7"
+    local notes="$8"
+
+    actual="$(clamp "$actual" 220)"
+
+    case "$status" in
+        PASS) ((PASS_COUNT++)) ;;
+        FAIL) ((FAIL_COUNT++)) ;;
+        WARNING) ((WARN_COUNT++)) ;;
+        N/A) ((NA_COUNT++)) ;;
+        INFO) ((INFO_COUNT++)) ;;
+    esac
+
+    append_row "$section" "$sno" "$item" "$command_used" "$expected" "$actual" "$status" "$notes"
+    log_msg "[$status] $section / $sno :: $item"
+}
+
+section_banner() {
+    printf '\n%s\n' "============================================================" | tee -a "$LOG_FILE"
+    printf '%s\n' "$1" | tee -a "$LOG_FILE"
+    printf '%s\n' "============================================================" | tee -a "$LOG_FILE"
+}
+
+init_csv
+
+check_hardware() {
+    section_banner "Running HARDWARE checks"
+    local sno=0
+    local out known ver rdate model sockets cpus corespc threads numa mem_line dimms populated
+    local out2 out3 out4 out5 out6 out7 out8 out9 out10 out11 fail_psu fail_fan overheat crit hba_info
+    local cmd actual status
+
+    sno=$((sno+1)); cmd="dmidecode -s system-product-name"; out="$(run 15 $cmd)"
+    actual="${out:-Unable to retrieve}"
+    status=$([ -n "$out" ] && echo "$STATUS_PASS" || echo "$STATUS_WARN")
+    record_check "Hardware" "$sno" "Server Model" "$cmd" "Valid server model string" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="dmidecode -s system-manufacturer"; out="$(run 15 $cmd)"
+    known=""
+    case "$(printf '%s' "$out" | tr '[:lower:]' '[:upper:]')" in
+        *DELL*|*HPE*|*HEWLETT*|*LENOVO*|*HUAWEI*|*CISCO*) known=1 ;;
+    esac
+    actual="${out:-Unable to retrieve}"
+    if [ -n "$out" ] && [ -n "$known" ]; then status="$STATUS_PASS"; else status="$STATUS_WARN"; fi
+    record_check "Hardware" "$sno" "Manufacturer" "$cmd" "Dell / HPE / Lenovo / Huawei / Cisco" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="dmidecode -s system-serial-number"; out="$(run 15 $cmd)"
+    actual="${out:-Unable to retrieve}"
+    if [ -n "$out" ] && [ "${out,,}" != "none" ] && [ "${out,,}" != "to be filled by o.e.m." ]; then status="$STATUS_PASS"; else status="$STATUS_WARN"; fi
+    record_check "Hardware" "$sno" "Service Tag / Serial Number" "$cmd" "Valid non-empty serial" "$actual" "$status" ""
+
+    sno=$((sno+1))
+    record_check "Hardware" "$sno" "HW Warranty (EOSL/EOL)" "OEM Portal Check" "In Warranty" "Manual verification required via OEM portal" "$STATUS_NA" "Check vendor portal with serial number"
+
+    sno=$((sno+1)); cmd="dmidecode -t bios"; out="$(run 15 $cmd)"
+    ver="$(printf '%s\n' "$out" | grep -i 'Version' | head -1)"
+    rdate="$(printf '%s\n' "$out" | grep -i 'Release Date' | head -1)"
+    actual="$( [ -n "$ver" ] && printf '%s | %s' "$ver" "$rdate" || printf '%s' "Unable to retrieve" )"
+    status=$([ -n "$ver" ] && echo "$STATUS_INFO" || echo "$STATUS_WARN")
+    record_check "Hardware" "$sno" "BIOS Version" "$cmd" "Latest approved BIOS version" "$actual" "$status" "Compare with vendor advisory"
+
+    sno=$((sno+1))
+    if cmd_exists ipmitool; then
+        cmd="ipmitool mc info | grep -i 'Firmware Revision'"
+        out="$(run 15 "ipmitool mc info 2>/dev/null | grep -i 'Firmware Revision'")"
+        actual="${out:-Unable to retrieve}"
+        status=$([ -n "$out" ] && echo "$STATUS_INFO" || echo "$STATUS_WARN")
+        record_check "Hardware" "$sno" "iLO/BMC Firmware Version" "$cmd" "Latest approved iLO/BMC firmware version" "$actual" "$status" "Compare with vendor advisory. Note: BIOS version is NOT retrievable via ipmitool - use dmidecode (see BIOS Version check)."
+    else
+        record_check "Hardware" "$sno" "iLO/BMC Firmware Version" "ipmitool mc info" "Latest approved iLO/BMC firmware version" "ipmitool not available" "$STATUS_WARN" "Install ipmitool or check iLO/iDRAC web UI manually"
+    fi
+
+    sno=$((sno+1)); cmd="lscpu"; out="$(run 15 $cmd)"
+    model="$(printf '%s\n' "$out" | grep -i '^Model name' | head -1)"
+    actual="${model:-Unable to retrieve}"
+    status=$([ -n "$model" ] && echo "$STATUS_PASS" || echo "$STATUS_WARN")
+    record_check "Hardware" "$sno" "CPU Model" "lscpu | grep 'Model name'" "Expected CPU model per spec sheet" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="lscpu"
+    sockets="$(printf '%s\n' "$out" | grep -i '^Socket(s)' | head -1)"
+    cpus="$(printf '%s\n' "$out" | grep -i '^CPU(s):' | head -1)"
+    corespc="$(printf '%s\n' "$out" | grep -i '^Core(s) per socket' | head -1)"
+    threads="$(printf '%s\n' "$out" | grep -i '^Thread(s) per core' | head -1)"
+    actual="$(printf '%s | %s | %s | %s' "${sockets:-}" "${cpus:-}" "${corespc:-}" "${threads:-}" | sed 's/^ | //; s/ | $//')"
+    status=$([ -n "$actual" ] && echo "$STATUS_PASS" || echo "$STATUS_WARN")
+    record_check "Hardware" "$sno" "CPU Cores / Sockets / Threads" "$cmd" "Matches hardware spec" "${actual:-Unable to retrieve}" "$status" ""
+
+    sno=$((sno+1)); cmd="lscpu"
+    numa="$(printf '%s\n' "$out" | grep -i 'NUMA node(s)' | head -1)"
+    actual="${numa:-Unable to retrieve}"
+    status=$([ -n "$numa" ] && echo "$STATUS_PASS" || echo "$STATUS_WARN")
+    record_check "Hardware" "$sno" "NUMA Nodes" "$cmd" "≥1 NUMA node detected" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="free -h"; out2="$(run 15 $cmd)"
+    mem_line="$(printf '%s\n' "$out2" | grep -i '^Mem:' | head -1)"
+    actual="${mem_line:-Unable to retrieve}"
+    status=$([ -n "$mem_line" ] && echo "$STATUS_PASS" || echo "$STATUS_WARN")
+    record_check "Hardware" "$sno" "Memory Installed (Total RAM)" "$cmd" "Matches server spec" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="dmidecode -t memory"; out3="$(run 20 $cmd)"
+    dimms="$(printf '%s\n' "$out3" | grep -c 'Memory Device' 2>/dev/null || true)"
+    populated="$(printf '%s\n' "$out3" | grep -c 'Size:.*GB' 2>/dev/null || true)"
+    actual="Total slots: ${dimms:-0} | Populated: ${populated:-0}"
+    status=$([ "${populated:-0}" -gt 0 ] 2>/dev/null && echo "$STATUS_PASS" || echo "$STATUS_WARN")
+    record_check "Hardware" "$sno" "Memory Slots / DIMMs" "$cmd" "All expected DIMMs populated" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="lsblk -d -o NAME,SIZE,TYPE,ROTA,MODEL"; out4="$(run 15 $cmd)"
+    actual="${out4:-No block devices found}"
+    status=$([ -n "$out4" ] && echo "$STATUS_PASS" || echo "$STATUS_FAIL")
+    record_check "Hardware" "$sno" "Local Disk Devices & Sizes" "$cmd" "All expected disks detected" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="lspci | grep -i ethernet"; out5="$(run 15 "$cmd")"
+    actual="${out5:-Unable to retrieve or no NIC}"
+    status=$([ -n "$out5" ] && echo "$STATUS_PASS" || echo "$STATUS_WARN")
+    record_check "Hardware" "$sno" "NIC Hardware (PCIe)" "$cmd" "Expected NIC cards detected" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="ip -o link show | awk -F': ' '{print \$2}' | grep -v lo"; out6="$(run 15 "$cmd")"
+    actual=""
+    for iface in $(printf '%s\n' "$out6" | awk 'NF' | head -6); do
+        d="$(run 12 "ethtool -i $iface 2>/dev/null | grep driver")"
+        [ -n "$d" ] && actual="${actual}${iface}: $(first_line "$d") | "
+    done
+    actual="${actual% | }"
+    status=$([ -n "$actual" ] && echo "$STATUS_PASS" || echo "$STATUS_WARN")
+    record_check "Hardware" "$sno" "NIC Driver" "ethtool -i <interface>" "Vendor-supported driver loaded" "${actual:-Unable to retrieve}" "$status" ""
+
+    sno=$((sno+1))
+    if cmd_exists ipmitool; then
+        cmd="ipmitool sensor list | grep -i 'psu\\|power supply'"
+        out7="$(run 20 "ipmitool sensor list 2>/dev/null | grep -i 'psu\|power supply'")"
+        fail_psu="$(printf '%s\n' "$out7" | grep -Ei '(fail|fault|absent|warning|critical)' || true)"
+        actual="${out7:-No PSU sensors found via IPMI}"
+        if [ -n "$fail_psu" ]; then status="$STATUS_FAIL"; elif [ -n "$out7" ]; then status="$STATUS_PASS"; else status="$STATUS_WARN"; fi
+        record_check "Hardware" "$sno" "PSU Status" "$cmd" "All PSUs OK / Present" "$actual" "$status" ""
+    else
+        record_check "Hardware" "$sno" "PSU Status" "ipmitool sensor" "All PSUs OK" "ipmitool not available" "$STATUS_WARN" "Install ipmitool or check iLO/iDRAC manually"
+    fi
+
+    sno=$((sno+1))
+    if cmd_exists ipmitool; then
+        cmd="ipmitool sensor list | grep -i fan"
+        out8="$(run 20 "ipmitool sensor list 2>/dev/null | grep -i fan")"
+        fail_fan="$(printf '%s\n' "$out8" | grep -Ei '(fail|fault|absent|warning|critical)' || true)"
+        actual="${out8:-No fan sensors found via IPMI}"
+        if [ -n "$fail_fan" ]; then status="$STATUS_FAIL"; elif [ -n "$out8" ]; then status="$STATUS_PASS"; else status="$STATUS_WARN"; fi
+        record_check "Hardware" "$sno" "Fan Status" "$cmd" "All fans operating normally" "$actual" "$status" ""
+    else
+        record_check "Hardware" "$sno" "Fan Status" "ipmitool sensor" "All fans OK" "ipmitool not available" "$STATUS_WARN" ""
+    fi
+
+    sno=$((sno+1))
+    if cmd_exists ipmitool; then
+        cmd="ipmitool sensor list | grep -i temp"
+        out9="$(run 20 "ipmitool sensor list 2>/dev/null | grep -i temp")"
+        overheat="$(printf '%s\n' "$out9" | grep -Ei '(critical|fail|non-recoverable)' || true)"
+        actual="${out9:-No temp sensors via IPMI}"
+        if [ -n "$overheat" ]; then status="$STATUS_FAIL"; elif [ -n "$out9" ]; then status="$STATUS_PASS"; else status="$STATUS_WARN"; fi
+        record_check "Hardware" "$sno" "Temperature Sensors" "$cmd" "No overheating / all below threshold" "$actual" "$status" ""
+    else
+        record_check "Hardware" "$sno" "Temperature Sensors" "ipmitool sensor" "No overheating" "ipmitool not available" "$STATUS_WARN" ""
+    fi
+
+    sno=$((sno+1))
+    if cmd_exists ipmitool; then
+        cmd="ipmitool sel list | tail -20"
+        out10="$(run 20 "ipmitool sel list 2>/dev/null | tail -20")"
+        crit="$(printf '%s\n' "$out10" | grep -Ei '(critical|fail|error)' || true)"
+        actual="${out10:-SEL empty or unavailable}"
+        if [ -n "$crit" ]; then status="$STATUS_WARN"; else status="$STATUS_PASS"; fi
+        record_check "Hardware" "$sno" "HW Event Log (SEL)" "$cmd" "No critical hardware errors in SEL" "$actual" "$status" ""
+    else
+        record_check "Hardware" "$sno" "HW Event Log (SEL)" "ipmitool sel list" "No critical errors" "ipmitool not available – check iLO/iDRAC portal manually" "$STATUS_WARN" ""
+    fi
+
+    sno=$((sno+1))
+    record_check "Hardware" "$sno" "HW Diagnostics" "OEM Diagnostic Tool (ILO/iDRAC/IMM)" "All diagnostics pass" "Manual step – run via iLO/iDRAC/IMM console" "$STATUS_NA" "Collect screenshots as evidence"
+
+    sno=$((sno+1))
+    record_check "Hardware" "$sno" "Power Redundancy (Dual PSU / Dual PDU)" "Physical inspection" "Two PSUs connected to two separate PDUs" "Manual confirmation required from PM/DC team" "$STATUS_NA" "Confirmed by PM or data centre team"
+
+    sno=$((sno+1))
+    if cmd_exists systool; then
+        cmd="systool -c fc_host -v"
+        out11="$(run 20 "systool -c fc_host -v 2>/dev/null | grep -E '(port_name|port_state|speed)'")"
+    else
+        cmd="ls /sys/class/fc_host/"
+        out11="$(run 10 "ls /sys/class/fc_host/ 2>/dev/null")"
+    fi
+    hba_info="${out11:-No FC host adapters found or systool unavailable}"
+    status=$([ -n "$out11" ] && echo "$STATUS_INFO" || echo "$STATUS_WARN")
+    record_check "Hardware" "$sno" "Storage HBA / FC Ports" "$cmd" "WWNs online, ports active, expected speed" "$hba_info" "$status" "Confirm WWNs with storage team"
+}
+
+check_os() {
+    section_banner "Running OPERATING SYSTEM checks"
+    local sno=0
+    local hn ip out out2 out3 out4 out5 out6 out7 out8 out9 out10 out11 out12 out13 out14 out15 out16 out17 out18 out19 out20 out21 out22
+    local cmd actual status gov_file swap_val zabbix_running
+    local users_to_check="unx61234 cruisecam"
+
+    sno=$((sno+1)); cmd="hostnamectl --static ; ip a"; hn="$(run 10 "hostnamectl --static")"; ip="$(run 15 "ip -4 addr show | grep -v '127.0.0.1' | grep inet | awk '{print \$2}' | head -5")"
+    actual="Hostname: ${hn:-} | IPs: $(printf '%s' "$ip" | tr '\n' ' ')"
+    status=$([ -n "$hn" ] && echo "$STATUS_PASS" || echo "$STATUS_FAIL")
+    record_check "Operating System" "$sno" "Hostname & IP Address" "$cmd" "Correct FQDN and IP configured" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="cat /etc/os-release"; out="$(run 15 "$cmd")"
+    actual="$(printf '%s\n' "$out" | grep -i '^PRETTY_NAME' | head -1)"
+    [ -z "$actual" ] && actual="$(printf '%s' "$out" | head -c 100)"
+    case "${out,,}" in
+        *suse*|*sles*) status="$STATUS_PASS" ;;
+        *) status="$STATUS_WARN" ;;
+    esac
+    record_check "Operating System" "$sno" "OS Release" "$cmd" "SUSE Linux Enterprise Server (approved version)" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="uname -r"; out2="$(run 10 "$cmd")"
+    actual="${out2:-Unable to retrieve}"
+    status=$([ -n "$out2" ] && echo "$STATUS_PASS" || echo "$STATUS_FAIL")
+    record_check "Operating System" "$sno" "Kernel Version" "$cmd" "Supported/approved kernel version" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="df -hT"; out3="$(run 15 "df -hT | grep -v tmpfs | grep -v devtmpfs")"
+    actual="${out3:-Unable to retrieve}"
+    status="$STATUS_INFO"
+    record_check "Operating System" "$sno" "OS Partitions / Filesystem Layout" "$cmd" "/var≥100G  /usr≥20G  /≥20G" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="lscpu"; out4="$(run 15 "$cmd")"
+    actual="$(printf '%s | %s' "$(printf '%s\n' "$out4" | grep -i '^Model name' | head -1)" "$(printf '%s\n' "$out4" | grep -i '^CPU(s):' | head -1)")"
+    [ "$actual" = " | " ] && actual="Unable to retrieve"
+    status=$([ "$actual" != "Unable to retrieve" ] && echo "$STATUS_PASS" || echo "$STATUS_WARN")
+    record_check "Operating System" "$sno" "CPU Details (OS view)" "$cmd" "CPU model & cores match HW layer" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="free -h"; out5="$(run 10 "$cmd")"
+    actual="${out5:-Unable to retrieve}"
+    status=$([ -n "$out5" ] && echo "$STATUS_PASS" || echo "$STATUS_FAIL")
+    record_check "Operating System" "$sno" "Memory Validation" "$cmd" "Memory matches hardware specification" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="id <username>"; actual=""
+    for u in $users_to_check; do
+        o="$(run 10 "id $u")"
+        if [ -n "$o" ]; then
+            actual="${actual}${u}: EXISTS ($(first_line "$o")) | "
+        else
+            actual="${actual}${u}: NOT FOUND | "
+        fi
+    done
+    actual="${actual% | }"
+    record_check "Operating System" "$sno" "Local UNIX Users" "$cmd" "Required service accounts present" "$actual" "$STATUS_WARN" "Adjust user list per server role"
+
+    sno=$((sno+1)); cmd="sudo -l"; out6="$(run 20 "sudo -l 2>&1 | head -20")"
+    actual="${out6:-Unable to retrieve}"
+    status=$([ -n "$out6" ] && echo "$STATUS_PASS" || echo "$STATUS_WARN")
+    record_check "Operating System" "$sno" "Sudo Access" "$cmd" "Sudo permissions configured" "$actual" "$status" ""
+
+    for bond_name in bond0 bond1; do
+        sno=$((sno+1))
+        cmd="cat /proc/net/bonding/$bond_name"
+        bond_file="/proc/net/bonding/$bond_name"
+        if [ -f "$bond_file" ]; then
+            out7="$(run 15 "cat $bond_file")"
+            active_nics="$(printf '%s\n' "$out7" | grep -c 'MII Status: up' || true)"
+            mode="$(printf '%s\n' "$out7" | grep -i 'Bonding Mode' | head -1)"
+            actual="$(printf '%s | Active NICs: %s' "${mode:-}" "${active_nics:-0}")"
+            [ "${active_nics:-0}" -ge 2 ] 2>/dev/null && status="$STATUS_PASS" || status="$STATUS_WARN"
+            record_check "Operating System" "$sno" "Network Bonding ($bond_name)" "$cmd" "Active-active/active-backup; NICs from different switches" "$actual" "$status" "Confirm NIC diversity with network team"
+        else
+            actual="$bond_file not found – bond not configured"
+            record_check "Operating System" "$sno" "Network Bonding ($bond_name)" "$cmd" "Bond interface active" "$actual" "$STATUS_WARN" ""
+        fi
+    done
+
+    sno=$((sno+1)); cmd="ethtool <interface> | grep Speed"
+    out8="$(run 20 "ip -o link show | awk -F': ' '{print \$2}' | grep -v lo")"
+    actual=""
+    for iface in $(printf '%s\n' "$out8" | awk 'NF' | head -8); do
+        spd="$(run 12 "ethtool $iface 2>/dev/null | grep -i speed")"
+        [ -n "$spd" ] && actual="${actual}${iface}: $(first_line "$spd") | "
+    done
+    actual="${actual% | }"
+    status=$([ -n "$actual" ] && echo "$STATUS_INFO" || echo "$STATUS_WARN")
+    record_check "Operating System" "$sno" "NIC Speed" "$cmd" "10G or higher per interface" "${actual:-Unable to retrieve}" "$status" "Submit risk email if speed < 10G"
+
+    sno=$((sno+1)); gov_file="/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"; cmd="cat $gov_file"
+    if [ -f "$gov_file" ]; then
+        out9="$(run 5 "cat $gov_file")"
+        actual="${out9:-Unable to read}"
+        if printf '%s' "$out9" | grep -qi performance; then status="$STATUS_PASS"; else status="$STATUS_FAIL"; fi
+        record_check "Operating System" "$sno" "CPU Power Mode / Governor" "$cmd" "performance (persistent)" "$actual" "$status" ""
+    else
+        cmd="tuned-adm active"
+        out10="$(run 10 "tuned-adm active 2>/dev/null")"
+        actual="${out10:-cpufreq governor file not found}"
+        status=$([ -n "$out10" ] && echo "$STATUS_INFO" || echo "$STATUS_WARN")
+        record_check "Operating System" "$sno" "CPU Power Mode / Governor" "$cmd" "throughput-performance or latency-performance profile" "$actual" "$status" ""
+    fi
+
+    sno=$((sno+1)); cmd="timedatectl"; out11="$(run 15 "$cmd")"
+    actual="${out11:-Unable to retrieve}"
+    if printf '%s' "$out11" | grep -Eqi 'synchronized.*yes'; then status="$STATUS_PASS"; else status="$STATUS_WARN"; fi
+    record_check "Operating System" "$sno" "NTP Configuration / Time Sync" "$cmd" "Time synchronized, correct local timezone" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="chronyc sources -v"; out12="$(run 20 "chronyc sources -v 2>/dev/null | head -30")"
+    if [ -n "$out12" ]; then
+        good_src="$(printf '%s\n' "$out12" | grep -cE '^\^[\*\+]' || true)"
+        actual="$out12"
+        [ "${good_src:-0}" -gt 0 ] 2>/dev/null && status="$STATUS_PASS" || status="$STATUS_WARN"
+        record_check "Operating System" "$sno" "Chrony NTP Sources" "$cmd" "Valid NTP sources with sync (^* or ^+)" "$actual" "$status" ""
+    else
+        record_check "Operating System" "$sno" "Chrony NTP Sources" "$cmd" "Valid NTP sources" "chronyd not running or not installed" "$STATUS_WARN" ""
+    fi
+
+    sno=$((sno+1)); cmd="grep -E '(@@|@)[0-9]' /etc/rsyslog.conf"; out13="$(run 10 "grep -E '(@@|@)[0-9]' /etc/rsyslog.conf /etc/rsyslog.d/*.conf 2>/dev/null")"
+    actual="${out13:-No remote syslog target found}"
+    status=$([ -n "$out13" ] && echo "$STATUS_PASS" || echo "$STATUS_WARN")
+    record_check "Operating System" "$sno" "SIEM Logging (rsyslog remote target)" "$cmd" "SIEM / CDC IP configured as remote syslog target" "$actual" "$status" "Confirm IP with CDC/SIEM team"
+
+    sno=$((sno+1)); cmd="systemctl is-active rsyslog"; out14="$(run 10 "$cmd")"
+    actual="${out14:-Unable to check}"
+    if printf '%s' "$out14" | grep -qi active; then status="$STATUS_PASS"; else status="$STATUS_FAIL"; fi
+    record_check "Operating System" "$sno" "Rsyslog Service" "$cmd" "active (running)" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="realm list / wbinfo -P"; ad_out=""
+    for c in "realm list" "wbinfo -P" "net ads info 2>/dev/null"; do
+        o="$(run 15 "$c")"
+        if [ -n "$o" ]; then ad_out="$o"; break; fi
+    done
+    actual="$(first_line "$ad_out")"
+    [ -z "$actual" ] && actual="AD join not detected (realm/winbind not found)"
+    status=$([ -n "$ad_out" ] && echo "$STATUS_PASS" || echo "$STATUS_WARN")
+    record_check "Operating System" "$sno" "AD Domain Join" "$cmd" "Host joined to Active Directory domain" "$actual" "$status" "Run 'realm list' or check sssd/winbind manually"
+
+    sno=$((sno+1))
+    record_check "Operating System" "$sno" "AD User Validation" "id <AD_username>" "AD authentication resolves users" "Requires an AD username to test – manual step" "$STATUS_NA" "Provide AD username and run: id <user>"
+
+    sno=$((sno+1)); cmd="rpm -q atop sysstat virt-top"
+    found=""; missing=""
+    for p in atop sysstat virt-top; do
+        if rpm -q "$p" >/dev/null 2>&1; then found="$found $p"; else missing="$missing $p"; fi
+    done
+    actual="Installed:${found:- none} | Missing:${missing:- none}"
+    [ -z "$missing" ] && status="$STATUS_PASS" || status="$STATUS_FAIL"
+    record_check "Operating System" "$sno" "Monitoring Tools (atop/sar/virt-top)" "$cmd" "All monitoring packages installed" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="rpm -q jq curl wget ..."
+    ufound=""; umiss=""
+    for p in jq curl wget lsof strace tcpdump; do
+        if rpm -q "$p" >/dev/null 2>&1 || command -v "$p" >/dev/null 2>&1; then ufound="$ufound $p"; else umiss="$umiss $p"; fi
+    done
+    actual="OK:${ufound:- none} | Missing:${umiss:- none}"
+    [ -z "$umiss" ] && status="$STATUS_PASS" || status="$STATUS_WARN"
+    record_check "Operating System" "$sno" "Utility Packages (jq, curl, etc.)" "$cmd" "Required utility packages installed" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="sysctl vm.swappiness"; out15="$(run 10 "$cmd")"
+    swap_val="$(printf '%s\n' "$out15" | sed -n 's/.*=\s*\([0-9]\+\).*/\1/p' | head -1)"
+    actual="${out15:-Unable to retrieve}"
+    if [ "$swap_val" = "5" ] || [ "$swap_val" = "10" ]; then
+        status="$STATUS_PASS"
+    elif [ -n "$swap_val" ] && [ "$swap_val" -ge 0 ] 2>/dev/null && [ "$swap_val" -le 20 ] 2>/dev/null; then
+        status="$STATUS_WARN"
+    else
+        status="$STATUS_FAIL"
+    fi
+    record_check "Operating System" "$sno" "Swappiness Value" "$cmd" "Value = 5 or 10" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="crontab -l"; out16="$(run 15 "crontab -l 2>/dev/null")"; out17="$(run 15 "cat /etc/cron.d/* /var/spool/cron/tabs/root 2>/dev/null")"
+    actual="$(printf '%s\n%s' "$out16" "$out17" | sed '/^$/d' | head -c 300)"
+    [ -z "$actual" ] && actual="No crontab entries"
+    if printf '%s\n%s' "$out16" "$out17" | grep -qi 'fstrim'; then status="$STATUS_PASS"; else status="$STATUS_WARN"; fi
+    record_check "Operating System" "$sno" "Crontab Jobs (fstrim & ethernet scripts)" "$cmd" "fstrim and ethernet maintenance scripts present" "$actual" "$status" "Check all cron directories"
+
+    sno=$((sno+1)); cmd="multipath -ll"
+    if cmd_exists multipath; then
+        out18="$(run 20 "multipath -ll 2>/dev/null | head -40")"
+        actual="${out18:-No multipath output}"
+        [ -n "$out18" ] && status="$STATUS_PASS" || status="$STATUS_WARN"
+        record_check "Operating System" "$sno" "Multipath (LUN paths)" "$cmd" "All LUN paths active (status: active)" "$actual" "$status" ""
+    else
+        record_check "Operating System" "$sno" "Multipath (LUN paths)" "$cmd" "All LUN paths active" "multipath not installed / no SAN storage" "$STATUS_WARN" ""
+    fi
+
+    sno=$((sno+1)); cmd="mount | grep -E '(ocfs2|gfs2)'"; out19="$(run 10 "$cmd")"
+    actual="${out19:-No OCFS2/GFS2 mounts found}"
+    status=$([ -n "$out19" ] && echo "$STATUS_PASS" || echo "$STATUS_WARN")
+    record_check "Operating System" "$sno" "Datastore Mounts (OCFS2/GFS2)" "$cmd" "Cluster filesystems mounted" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="virsh pool-list --all"
+    if cmd_exists virsh; then
+        out20="$(run 20 "virsh pool-list --all 2>/dev/null")"
+        actual="${out20:-No pools or virsh unavailable}"
+        [ -n "$out20" ] && status="$STATUS_PASS" || status="$STATUS_WARN"
+        record_check "Operating System" "$sno" "Libvirt Storage Pools" "$cmd" "All pools active and names match datastore" "$actual" "$status" ""
+    else
+        record_check "Operating System" "$sno" "Libvirt Storage Pools" "$cmd" "All pools active" "virsh not installed / not a KVM host" "$STATUS_NA" ""
+    fi
+
+    sno=$((sno+1)); cmd="ipmitool chassis status"
+    if cmd_exists ipmitool; then
+        out21="$(run 15 "ipmitool chassis status 2>/dev/null")"
+        actual="${out21:-Unable to retrieve}"
+        if [ -n "$out21" ] && printf '%s' "$out21" | grep -qi 'power is on'; then status="$STATUS_PASS"; else status="$STATUS_WARN"; fi
+        record_check "Operating System" "$sno" "Hardware Health (IPMI chassis)" "$cmd" "No hardware alarms" "$actual" "$status" ""
+    else
+        record_check "Operating System" "$sno" "Hardware Health (IPMI chassis)" "$cmd" "No hardware alarms" "ipmitool not available" "$STATUS_WARN" ""
+    fi
+
+    sno=$((sno+1))
+    record_check "Operating System" "$sno" "Bond Failover Test" "Manual test procedure" "Failover confirmed with evidence" "Manual test required – unplug one NIC per bond and verify traffic continuity" "$STATUS_NA" "Collect screenshots during maintenance window"
+
+    sno=$((sno+1))
+    local z_running=""
+    for svc in zabbix-agent zabbix-agent2; do
+        o="$(run 10 "systemctl is-active $svc 2>/dev/null")"
+        if printf '%s' "$o" | grep -qi active; then z_running=1; break; fi
+    done
+    actual=$([ -n "$z_running" ] && echo "Agent running" || echo "Zabbix agent not active/installed")
+    status=$([ -n "$z_running" ] && echo "$STATUS_PASS" || echo "$STATUS_WARN")
+    record_check "Operating System" "$sno" "Zabbix Agent (OS Monitoring)" "systemctl is-active zabbix-agent" "Zabbix agent active, host visible in dashboard" "$actual" "$status" "Confirm OS+SNMP monitoring with Zabbix team"
+
+    sno=$((sno+1))
+    record_check "Operating System" "$sno" "Zabbix Metrics (CPU/Memory graphs)" "Zabbix Dashboard" "CPU/Memory graphs populating" "Manual verification in Zabbix UI" "$STATUS_NA" "Confirmation from Zabbix team"
+
+    sno=$((sno+1))
+    record_check "Operating System" "$sno" "iLO/iDRAC SNMP Monitoring" "Zabbix Dashboard / SNMP" "Hardware monitored via SNMP from Zabbix" "Manual verification in Zabbix UI" "$STATUS_NA" "Confirmation from Zabbix team"
+
+    sno=$((sno+1)); cmd="zypper ref"; out22="$(run 30 "zypper ref --repo 2>&1 | head -20")"
+    actual="${out22:-zypper not available}"
+    status=$([ -n "$out22" ] && echo "$STATUS_PASS" || echo "$STATUS_WARN")
+    record_check "Operating System" "$sno" "RMT / SUSE Repository Communication" "$cmd" "Repository refresh succeeds (RMT/SCC reachable)" "$actual" "$status" "Also check: ping <RMT-IP> and telnet <RMT-IP> 443"
+}
+
+check_cluster() {
+    section_banner "Running CLUSTER checks"
+    local sno=0
+    local crm_available out out2 out3 out5 out6 corosync_conf token_val consensus_val tv cv out9 out10 sbd_dev dev_path dump dump2 wd_val mw_val lst
+    local cmd actual status
+
+    if cmd_exists crm; then crm_available=1; else crm_available=0; fi
+
+    sno=$((sno+1)); cmd="crm configure show | grep cluster-name"
+    if [ "$crm_available" -eq 1 ]; then
+        out="$(run 20 "crm configure show 2>/dev/null | grep cluster-name")"
+        actual="${out:-cluster-name not set}"
+        status=$([ -n "$out" ] && echo "$STATUS_PASS" || echo "$STATUS_WARN")
+        record_check "Cluster" "$sno" "Cluster Name" "$cmd" "Expected cluster name set" "$actual" "$status" ""
+    else
+        record_check "Cluster" "$sno" "Cluster Name" "$cmd" "Cluster name configured" "crm/pacemaker not installed" "$STATUS_NA" ""
+    fi
+
+    sno=$((sno+1)); cmd="crm status"
+    if [ "$crm_available" -eq 1 ]; then
+        out2="$(run 30 "crm status 2>/dev/null")"
+        actual="${out2:-Unable to retrieve}"
+        if printf '%s' "$out2" | grep -qi failed; then status="$STATUS_WARN"; else status="$STATUS_PASS"; fi
+        record_check "Cluster" "$sno" "Cluster Status" "$cmd" "All nodes online, no failed resources" "$(printf '%s' "$actual" | head -c 400)" "$status" ""
+    else
+        record_check "Cluster" "$sno" "Cluster Status" "$cmd" "All nodes online" "Not a cluster node or crm not installed" "$STATUS_NA" ""
+    fi
+
+    sno=$((sno+1)); cmd="crm node list"
+    if [ "$crm_available" -eq 1 ]; then
+        out3="$(run 20 "crm node list 2>/dev/null || crm_mon -1 2>/dev/null | grep Node")"
+        actual="${out3:-Unable to retrieve}"
+        status=$([ -n "$out3" ] && echo "$STATUS_INFO" || echo "$STATUS_WARN")
+        record_check "Cluster" "$sno" "Cluster Nodes" "$cmd" "All expected nodes listed" "$actual" "$status" ""
+    else
+        record_check "Cluster" "$sno" "Cluster Nodes" "$cmd" "Expected nodes listed" "Not applicable" "$STATUS_NA" ""
+    fi
+
+    sno=$((sno+1))
+    record_check "Cluster" "$sno" "Cluster Config Backup" "crm configure show > /opt/cluster-config-bkp-<date>" "Backup file created" "Manual step – run: crm configure show > /opt/cluster-config-bkp-$(date +%Y%m%d)" "$STATUS_NA" "Execute during maintenance window"
+
+    sno=$((sno+1)); cmd="systemctl is-active corosync"
+    out5="$(run 10 "systemctl is-active corosync 2>/dev/null")"
+    actual="${out5:-Service not found}"
+    if printf '%s' "$out5" | grep -qi active; then status="$STATUS_PASS"; else status="$STATUS_NA"; fi
+    record_check "Cluster" "$sno" "Corosync Service" "$cmd" "active (running)" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="systemctl is-active pacemaker"
+    out6="$(run 10 "systemctl is-active pacemaker 2>/dev/null")"
+    actual="${out6:-Service not found}"
+    if printf '%s' "$out6" | grep -qi active; then status="$STATUS_PASS"; else status="$STATUS_NA"; fi
+    record_check "Cluster" "$sno" "Pacemaker Service" "$cmd" "active (running)" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="cat /etc/corosync/corosync.conf"
+    corosync_conf="$(run 15 "cat /etc/corosync/corosync.conf 2>/dev/null")"
+    token_val="$(printf '%s\n' "$corosync_conf" | sed -n 's/.*token\s*[:=]\s*\([0-9]\+\).*/\1/p' | head -1)"
+    actual=$([ -n "$token_val" ] && printf 'token=%s' "$token_val" || printf 'Not found / corosync not installed')
+    if [ "$token_val" = "60000" ]; then status="$STATUS_PASS"; elif [ -n "$token_val" ]; then status="$STATUS_WARN"; else status="$STATUS_NA"; fi
+    record_check "Cluster" "$sno" "Corosync Token Timeout" "$cmd" "token=60000" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="corosync-cmapctl | grep consensus"
+    consensus_val="$(printf '%s\n' "$corosync_conf" | sed -n 's/.*consensus\s*[:=]\s*\([0-9]\+\).*/\1/p' | head -1)"
+    actual=$([ -n "$consensus_val" ] && printf 'consensus=%s' "$consensus_val" || printf 'Not found')
+    if [ "$consensus_val" = "72000" ]; then status="$STATUS_PASS"; elif [ -n "$consensus_val" ]; then status="$STATUS_WARN"; else status="$STATUS_NA"; fi
+    record_check "Cluster" "$sno" "Corosync Consensus Timeout" "$cmd" "consensus=72000" "$actual" "$status" ""
+
+    sno=$((sno+1))
+    if [ "$crm_available" -eq 1 ]; then
+        cmd="crm configure show <ocf-resource>"
+        out9="$(run 20 "crm configure show 2>/dev/null | grep -A20 -i ocfs")"
+        actual="$(printf '%s' "$out9" | head -c 300)"
+        [ -n "$out9" ] && status="$STATUS_INFO" || status="$STATUS_NA"
+        record_check "Cluster" "$sno" "OCFS2 Datastore Timeouts" "$cmd" "start=180 stop=300 monitor=600" "${actual:-No OCFS2 resource found}" "$status" ""
+    else
+        record_check "Cluster" "$sno" "OCFS2 Datastore Timeouts" "crm configure show" "start=180, stop=300, monitor=600" "Not applicable" "$STATUS_NA" ""
+    fi
+
+    sno=$((sno+1)); cmd="systemctl is-active sbd"
+    out10="$(run 10 "systemctl is-active sbd 2>/dev/null")"
+    actual="${out10:-Service not found}"
+    if printf '%s' "$out10" | grep -qi active; then status="$STATUS_PASS"; else status="$STATUS_NA"; fi
+    record_check "Cluster" "$sno" "SBD Service" "$cmd" "active (running)" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="sbd -d <device> dump"
+    sbd_dev="$(run 10 "grep SBD_DEVICE /etc/sysconfig/sbd 2>/dev/null")"
+    dev_path="$(printf '%s\n' "$sbd_dev" | sed -n 's/.*SBD_DEVICE=[\"'"'"']\?\(\/dev\/[^;\"'"'"']*\).*/\1/p' | head -1)"
+    if [ -n "$dev_path" ]; then
+        dump="$(run 20 "sbd -d $dev_path dump 2>/dev/null")"
+        actual="$(printf '%s' "$dump" | head -c 300)"
+        [ -n "$dump" ] && status="$STATUS_PASS" || status="$STATUS_WARN"
+        record_check "Cluster" "$sno" "SBD Devices" "$cmd" "Dump output returned, LUN ≈ 1GB" "$actual" "$status" ""
+    else
+        record_check "Cluster" "$sno" "SBD Devices" "$cmd" "Dump output returned" "SBD_DEVICE not configured or /etc/sysconfig/sbd absent" "$STATUS_NA" ""
+    fi
+
+    sno=$((sno+1)); cmd="cat /etc/sysconfig/sbd"
+    out11="$(run 10 "cat /etc/sysconfig/sbd 2>/dev/null")"
+    actual="$(printf '%s\n' "$out11" | grep -i 'SBD_WATCHDOG' | head -1)"
+    [ -z "$actual" ] && actual="SBD config not found"
+    status=$([ -n "$(printf '%s\n' "$out11" | grep -i 'SBD_WATCHDOG')" ] && echo "$STATUS_PASS" || echo "$STATUS_NA")
+    record_check "Cluster" "$sno" "SBD Watchdog Configuration" "$cmd" "Watchdog device configured" "$actual" "$status" ""
+
+    sno=$((sno+1)); cmd="sbd -d <dev> dump"
+    if [ -n "$dev_path" ]; then
+        dump2="$(run 20 "sbd -d $dev_path dump 2>/dev/null")"
+        wd_val="$(printf '%s\n' "$dump2" | sed -n 's/.*Timeout (watchdog).*:\s*\([0-9]\+\).*/\1/p' | head -1)"
+        mw_val="$(printf '%s\n' "$dump2" | sed -n 's/.*Timeout (msgwait).*:\s*\([0-9]\+\).*/\1/p' | head -1)"
+        actual="watchdog=${wd_val:-?} msgwait=${mw_val:-?}"
+        if [ "$wd_val" = "60" ] && [ "$mw_val" = "90" ]; then status="$STATUS_PASS"; else status="$STATUS_WARN"; fi
+        record_check "Cluster" "$sno" "SBD Timeout Parameters" "$cmd" "watchdog=60, allocate=10, loop=5, msgwait=90" "$actual" "$status" ""
+    else
+        record_check "Cluster" "$sno" "SBD Timeout Parameters" "$cmd" "watchdog=60 allocate=10 loop=5 msgwait=90" "SBD device not configured" "$STATUS_NA" ""
+    fi
+
+    sno=$((sno+1)); cmd="sbd -d <dev> list"
+    if [ -n "$dev_path" ]; then
+        lst="$(run 20 "sbd -d $dev_path list 2>/dev/null")"
+        actual="${lst:-No output}"
+        [ -n "$lst" ] && status="$STATUS_PASS" || status="$STATUS_WARN"
+        record_check "Cluster" "$sno" "SBD Node List" "$cmd" "All cluster nodes listed" "$actual" "$status" ""
+    else
+        record_check "Cluster" "$sno" "SBD Node List" "$cmd" "All nodes online in SBD" "SBD device not configured" "$STATUS_NA" ""
+    fi
+}
+
+# ============================================================
+# REMEDIATION TASKS (writes to the system) — only run with --fix
+# Triggered explicitly by ops via command line flag, never by default.
+# ============================================================
+check_remediation() {
+    section_banner "Running REMEDIATION tasks (WRITE operations)"
+    local sno=0
+    local cmd actual status
+
+    local target_user="unx61234"
+    local target_pass='F11st6J6b@12#$4'
+
+    # 1. Create unx61234 local user
+    sno=$((sno+1))
+    if id "$target_user" >/dev/null 2>&1; then
+        actual="User $target_user already exists"
+        status="$STATUS_INFO"
+    else
+        if useradd -m "$target_user" 2>/dev/null; then
+            actual="User $target_user created"
+            status="$STATUS_PASS"
+        else
+            actual="Failed to create user $target_user"
+            status="$STATUS_FAIL"
+        fi
+    fi
+    record_check "Remediation" "$sno" "Create local user ($target_user)" "useradd -m $target_user" "User exists on host" "$actual" "$status" ""
+
+    # 2. Set unx61234 password
+    sno=$((sno+1))
+    if echo "${target_user}:${target_pass}" | chpasswd 2>/dev/null; then
+        actual="Password set for $target_user"
+        status="$STATUS_PASS"
+    else
+        actual="Failed to set password for $target_user"
+        status="$STATUS_FAIL"
+    fi
+    record_check "Remediation" "$sno" "Set password ($target_user)" "chpasswd" "Password updated" "$actual" "$status" ""
+
+    # 3. Password never expires: chage -M -1 unx61234
+    sno=$((sno+1)); cmd="chage -M -1 $target_user"
+    if chage -M -1 "$target_user" 2>/dev/null; then
+        actual="Max password age set to -1 (never expires) for $target_user"
+        status="$STATUS_PASS"
+    else
+        actual="Failed to run chage -M -1 for $target_user"
+        status="$STATUS_FAIL"
+    fi
+    record_check "Remediation" "$sno" "Password never expires ($target_user)" "$cmd" "chage -l shows: Maximum number of days = -1" "$actual" "$status" ""
+
+    # 4. Root password change (interactive prompt, masked)
+    sno=$((sno+1))
+    echo
+    read -r -s -p "Enter NEW root password: " root_pass1
+    echo
+    read -r -s -p "Confirm NEW root password: " root_pass2
+    echo
+    if [ -z "$root_pass1" ]; then
+        actual="Empty password entered – root password NOT changed"
+        status="$STATUS_FAIL"
+    elif [ "$root_pass1" != "$root_pass2" ]; then
+        actual="Password mismatch – root password NOT changed"
+        status="$STATUS_FAIL"
+    else
+        if echo "root:${root_pass1}" | chpasswd 2>/dev/null; then
+            actual="Root password changed successfully"
+            status="$STATUS_PASS"
+        else
+            actual="Failed to change root password"
+            status="$STATUS_FAIL"
+        fi
+    fi
+    unset root_pass1 root_pass2
+    record_check "Remediation" "$sno" "Root Password Change" "chpasswd (interactive prompt, not logged)" "Root password updated" "$actual" "$status" ""
+
+    # 5. iLO / BMC user password change
+    sno=$((sno+1))
+    if cmd_exists ipmitool; then
+        echo
+        echo "Current iLO/BMC user list:"
+        ipmitool user list 1
+        echo
+        read -r -p "Enter iLO User ID to update (e.g. 2): " ilo_id
+        read -r -s -p "Enter NEW iLO password for user ID $ilo_id: " ilo_pass1
+        echo
+        read -r -s -p "Confirm NEW iLO password: " ilo_pass2
+        echo
+        if [ -z "$ilo_id" ] || [ -z "$ilo_pass1" ]; then
+            actual="Missing user ID or password – iLO password NOT changed"
+            status="$STATUS_FAIL"
+        elif [ "$ilo_pass1" != "$ilo_pass2" ]; then
+            actual="Password mismatch – iLO password NOT changed"
+            status="$STATUS_FAIL"
+        else
+            if ipmitool user set password "$ilo_id" "$ilo_pass1" >/dev/null 2>&1; then
+                actual="iLO password updated for user ID $ilo_id"
+                status="$STATUS_PASS"
+                echo
+                echo "Updated iLO/BMC user list:"
+                ipmitool user list 1
+            else
+                actual="Failed to update iLO password for user ID $ilo_id"
+                status="$STATUS_FAIL"
+            fi
+        fi
+        unset ilo_pass1 ilo_pass2
+    else
+        actual="ipmitool not available – cannot change iLO password"
+        status="$STATUS_NA"
+    fi
+    record_check "Remediation" "$sno" "iLO/BMC Password Change" "ipmitool user set password <id> <pass> (interactive prompt, not logged)" "iLO password updated for the specified user ID" "$actual" "$status" ""
+}
+
+write_summary() {
+    local total=$((PASS_COUNT + FAIL_COUNT + WARN_COUNT + NA_COUNT + INFO_COUNT))
+    local pass_rate
+    pass_rate=$(awk -v p="$PASS_COUNT" -v t="$total" 'BEGIN{if(t>0) printf "%.0f%%", (p/t)*100; else printf "N/A"}')
+
+    {
+        printf 'Physical Server QC Check Report\n'
+        printf 'Hostname,%s\n' "$HOST_SAFE"
+        printf 'Report Date,%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf 'Checked By,Automated QC Script\n'
+        printf '\nTotal Checks,%s\n' "$total"
+        printf 'PASS,%s\n' "$PASS_COUNT"
+        printf 'FAIL,%s\n' "$FAIL_COUNT"
+        printf 'WARNING,%s\n' "$WARN_COUNT"
+        printf 'N/A,%s\n' "$NA_COUNT"
+        printf 'INFO,%s\n' "$INFO_COUNT"
+        printf 'Pass Rate,%s\n' "$pass_rate"
+    } >> "$REPORT"
+}
+
+main() {
+    log_msg "============================================================"
+    log_msg "  Physical Server QC Check – Bash only"
+    log_msg "  Started : $(date '+%F %T')"
+    [ "$FIX_MODE" -eq 1 ] && log_msg "  Mode    : QC + REMEDIATION (--fix)"
+    log_msg "============================================================"
+
+    check_hardware
+    check_os
+    check_cluster
+
+    if [ "$FIX_MODE" -eq 1 ]; then
+        check_remediation
+    fi
+
+    write_summary
+
+    local total=$((PASS_COUNT + FAIL_COUNT + WARN_COUNT + NA_COUNT + INFO_COUNT))
+
+    printf '\n%s\n' "============================================================" | tee -a "$LOG_FILE"
+    printf 'TOTAL CHECKS : %s\n' "$total" | tee -a "$LOG_FILE"
+    printf 'PASS         : %s\n' "$PASS_COUNT" | tee -a "$LOG_FILE"
+    printf 'FAIL         : %s  ← ACTION REQUIRED\n' "$FAIL_COUNT" | tee -a "$LOG_FILE"
+    printf 'WARNING      : %s  ← Review recommended\n' "$WARN_COUNT" | tee -a "$LOG_FILE"
+    printf 'N/A          : %s\n' "$NA_COUNT" | tee -a "$LOG_FILE"
+    printf 'INFO         : %s\n' "$INFO_COUNT" | tee -a "$LOG_FILE"
+    printf 'QC SCORE     : %s\n' "$(awk -v p="$PASS_COUNT" -v t="$total" 'BEGIN{if(t>0) printf "%.0f%%", (p/t)*100; else printf "N/A"}')" | tee -a "$LOG_FILE"
+    printf '%s\n' "============================================================" | tee -a "$LOG_FILE"
+
+    printf '\nCSV report: %s\n' "$REPORT"
+
+    [ "$FAIL_COUNT" -eq 0 ]
+}
+
+main "$@"

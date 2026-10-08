@@ -1,0 +1,40 @@
+[Unit]
+Description=QC Portal — KVM Host Quality Check Dashboard
+Documentation=https://github.com/internal/qc-portal
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qcportal
+Group=qcportal
+WorkingDirectory=/opt/qc-portal
+EnvironmentFile=/etc/qc-portal/qc-portal.env
+
+# Use the virtualenv gunicorn
+ExecStart=/opt/qc-portal/venv/bin/gunicorn \
+    --workers 2 \
+    --threads 4 \
+    --worker-class gthread \
+    --bind 0.0.0.0:5000 \
+    --timeout 300 \
+    --keep-alive 5 \
+    --access-logfile /var/log/qc-portal/access.log \
+    --error-logfile  /var/log/qc-portal/error.log \
+    --log-level info \
+    "run:app"
+
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/qc-portal/instance /var/log/qc-portal /tmp
+
+[Install]
+WantedBy=multi-user.target

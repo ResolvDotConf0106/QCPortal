@@ -1,0 +1,51 @@
+{% extends 'base.html' %}
+
+{% block title %}Running QC — {{ host.name }}{% endblock %}
+
+{% block content %}
+
+<!-- Header -->
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
+    <div>
+        <h1 style="font-size: 1.8rem; font-weight: 800; color: var(--suse-dark-green);">
+            QC Execution: {{ host.name }}
+        </h1>
+        <p style="color: var(--text-muted); font-size: 0.95rem;">
+            Target Host: <strong style="color: var(--suse-dark-green);">{{ host.ip }}:{{ host.port }}</strong> | Serial Tag: <span class="serial-tag-badge">{{ host.serial_number or 'Detecting...' }}</span> | Mode: <span class="status-badge INFO">READ-ONLY</span>
+        </p>
+    </div>
+    <div id="qc-status-indicator">
+        <span class="status-badge INFO"><i class="fa-solid fa-spinner fa-spin"></i> Executing QC Checks...</span>
+    </div>
+</div>
+
+<!-- Live Output Console -->
+<div class="terminal-container">
+    <div class="terminal-header">
+        <div class="terminal-dots">
+            <div class="dot red"></div>
+            <div class="dot yellow"></div>
+            <div class="dot green"></div>
+        </div>
+        <div style="font-size: 0.8rem; color: #a7f3d0; font-family: monospace;">
+            ssh {{ host.username }}@{{ host.ip }} "bash /tmp/server_qc_check.sh"
+        </div>
+        <div></div>
+    </div>
+    <div class="terminal-body" id="terminal-body" data-host-id="{{ host.id }}">
+        <div class="log-line info">[INIT] Initializing SSH session to {{ host.ip }}...</div>
+    </div>
+</div>
+
+<!-- Action buttons bar below terminal -->
+<div style="margin-top: 1.5rem; display: flex; justify-content: space-between; align-items: center;">
+    <a href="{{ url_for('main.dashboard') }}" class="btn btn-outline">
+        <i class="fa-solid fa-arrow-left"></i> Back to Dashboard
+    </a>
+
+    <a href="{{ url_for('main.get_latest_report', host_id=host.id) }}" id="btn-view-report" class="btn btn-primary" style="display: none;">
+        <i class="fa-solid fa-file-csv"></i> View Generated Report
+    </a>
+</div>
+
+{% endblock %}
